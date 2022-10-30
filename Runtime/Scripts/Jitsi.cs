@@ -16,7 +16,7 @@ namespace AVStack.Jitsi
     internal const string Lib = "jitsi_meet_signalling_c";
 
     internal static Context context;
-    internal static ConcurrentQueue<IEnumerator> asyncOperationQueue;
+    public static ConcurrentQueue<IEnumerator> asyncOperationQueue;
 
     public static void Initialize()
     {
@@ -26,8 +26,14 @@ namespace AVStack.Jitsi
       Debug.Log("Initialising WebRTC");
       WebRTC.Initialize();
 
+#if UNITY_EDITOR
+      // Debug.Log("Initialising Jitsi logging");
+      // if (!NativeMethods.jitsi_logging_init_file("C:\\Users\\User\\Downloads\\jitsi-unity.log", "debug")) {
+      //   Debug.Log("Failed to initialise Jitsi logging");
+      // }
+#endif
+
       Debug.Log("Initialising Jitsi native");
-      // NativeMethods.jitsi_logging_init_stdout("debug");
       context = new Context();
 
       asyncOperationQueue = new ConcurrentQueue<IEnumerator>();
@@ -35,6 +41,11 @@ namespace AVStack.Jitsi
 
     public static void Dispose()
     {
+      if (webRtcCoroutine != null) {
+        monoBehaviour.StopCoroutine(webRtcCoroutine);
+      }
+      monoBehaviour = null;
+
       asyncOperationQueue = null;
 
       context.Dispose();
@@ -43,22 +54,14 @@ namespace AVStack.Jitsi
       WebRTC.Dispose();
     }
 
+    public static MonoBehaviour monoBehaviour;
+    static IEnumerator webRtcCoroutine;
     public static IEnumerator Update(MonoBehaviour parent)
     {
       Debug.Log("Starting WebRTC background task");
-      parent.StartCoroutine(WebRTC.Update());
-
-      IEnumerator op;
-      while (true)
-      {
-        if (asyncOperationQueue == null)
-          break;
-        
-        if (asyncOperationQueue.TryDequeue(out op))
-          yield return parent.StartCoroutine(op);
-        
-        yield return null;
-      }
+      monoBehaviour = parent;
+      webRtcCoroutine = WebRTC.Update();
+      yield return monoBehaviour.StartCoroutine(webRtcCoroutine);
     }
   }
 
@@ -154,12 +157,13 @@ namespace AVStack.Jitsi
     private MediaStreamTrack[] localTracks;
 
     private RTCPeerConnection peerConnection;
-    private MediaStream mediaStream;
 
     private Connection connection;
     private IConferenceDelegate conferenceDelegate;
     private IntPtr nativeConference;
 
+    private string conferenceName;
+    private string nick;
     internal Conference(Connection connection, string conferenceName, string nick, MediaStreamTrack[] localTracks, IConferenceDelegate conferenceDelegate)
     {
       this.conferenceDelegate = conferenceDelegate;
@@ -169,6 +173,9 @@ namespace AVStack.Jitsi
       this.InitPeerConnection();
 
       this.connection = connection;
+      this.conferenceName = conferenceName;
+      this.nick = nick;
+
       var agent = new Agent {
         opaque = GCHandle.ToIntPtr(GCHandle.Alloc(this)),
         participant_joined = ParticipantJoined,
@@ -176,8 +183,9 @@ namespace AVStack.Jitsi
         colibri_message_received = ColibriMessageReceived,
         offer_received = OfferReceived,
       };
+
       Debug.Log($"Created Agent opaque={agent.opaque}");
-      this.nativeConference = NativeMethods.jitsi_connection_join(Jitsi.context.nativeContext, connection.nativeConnection, conferenceName, nick, ref agent);
+      this.nativeConference = NativeMethods.jitsi_connection_join(Jitsi.context.nativeContext, this.connection.nativeConnection, conferenceName, nick, ref agent);
       if (this.nativeConference == IntPtr.Zero)
         throw new JitsiException("jitsi_connection_join failed");
     }
@@ -185,6 +193,7 @@ namespace AVStack.Jitsi
     ~Conference()
     {
       NativeMethods.jitsi_conference_free(this.nativeConference);
+      this.peerConnection.Close();
     }
 
     public string LocalEndpointId()
@@ -204,74 +213,84 @@ namespace AVStack.Jitsi
     private void InitPeerConnection()
     {
       this.peerConnection = new RTCPeerConnection();
-      this.mediaStream = new MediaStream();
 
-      this.peerConnection.OnTrack = e =>
+      this.peerConnection.OnTrack += e =>
       {
-        var mediaStream = e.Streams.First();
+        MediaStream receiveStream = e.Streams.First();
+        Debug.Log($"OnTrack streamId: {receiveStream.Id}");
 
-        var endpointId = mediaStream.Id.Split('-').First();
-        var participant = this.Participant(endpointId);
+        string endpointId = receiveStream.Id.Split('-').First();
+        Participant participant = this.Participant(endpointId);
 
         if (e.Track is VideoStreamTrack videoTrack)
         {
-          Debug.Log($"Video track added: {videoTrack.Id} in media stream: {mediaStream.Id}");
+          Debug.Log($"Video track added: {videoTrack}");
           videoTrack.OnVideoReceived += texture =>
           {
-            Debug.Log($"Received new video texture: {texture} for track: {videoTrack.Id} in media stream: {mediaStream.Id}");
+            Debug.Log($"Received new video texture: {texture} for track: {videoTrack}");
             Jitsi.asyncOperationQueue.Enqueue(this.conferenceDelegate.VideoReceived(participant, videoTrack, texture));
           };
           Jitsi.asyncOperationQueue.Enqueue(this.conferenceDelegate.RemoteVideoTrackAdded(participant, videoTrack));
 
-          mediaStream.OnRemoveTrack = e =>
+          receiveStream.OnRemoveTrack += e =>
           {
-            Debug.Log($"Video track removed: {videoTrack.Id} in media stream: {mediaStream.Id}");
+            Debug.Log($"Video track removed: {videoTrack}");
             Jitsi.asyncOperationQueue.Enqueue(this.conferenceDelegate.RemoteVideoTrackRemoved(participant, videoTrack));
           };
         }
         else if (e.Track is AudioStreamTrack audioTrack)
         {
-          Debug.Log($"Audio track added: {audioTrack.Id} in media stream: {mediaStream.Id}");
+          Debug.Log($"Audio track added: {audioTrack}");
           Jitsi.asyncOperationQueue.Enqueue(this.conferenceDelegate.RemoteAudioTrackAdded(participant, audioTrack));
           
-          mediaStream.OnRemoveTrack = e =>
+          receiveStream.OnRemoveTrack += e =>
           {
-            Debug.Log($"Audio track removed: {audioTrack.Id} in media stream: {mediaStream.Id}");
+            Debug.Log($"Audio track removed: {audioTrack}");
             Jitsi.asyncOperationQueue.Enqueue(this.conferenceDelegate.RemoteAudioTrackRemoved(participant, audioTrack));
           };
         }
       };
 
-      this.peerConnection.OnNegotiationNeeded = () =>
+      this.peerConnection.OnNegotiationNeeded += () =>
       {
         Debug.Log("Negotiation needed");
       };
 
-      this.peerConnection.OnConnectionStateChange = (state) =>
+      this.peerConnection.OnConnectionStateChange += (state) =>
       {
         Debug.Log($"Connection state change: {state}");
       };
 
-      this.peerConnection.OnIceCandidate = (candidate) =>
+      this.peerConnection.OnIceCandidate += (candidate) =>
       {
         Debug.Log($"ICE candidate: {candidate}");
       };
 
-      this.peerConnection.OnIceGatheringStateChange = (state) =>
+      this.peerConnection.OnIceGatheringStateChange += (state) =>
       {
         Debug.Log($"ICE gathering state change: {state}");
       };
 
-      this.peerConnection.OnIceConnectionChange = (state) =>
+      this.peerConnection.OnIceConnectionChange += (state) =>
       {
         Debug.Log($"ICE connection change: {state}");
       };
 
+      AddTracks();
+    }
+
+    private void AddTracks() {
       foreach (var track in this.localTracks)
       {
         Debug.Log($"Adding local track: {track}");
-        this.mediaStream.AddTrack(track);
-        this.peerConnection.AddTrack(track, this.mediaStream);
+
+        MediaStream sendStream = new MediaStream();
+        this.peerConnection.AddTrack(track, sendStream);
+
+        sendStream.OnRemoveTrack = e =>
+          {
+            Debug.Log($"Send track removed: {track}");
+          };
       }
     }
 
@@ -317,6 +336,7 @@ namespace AVStack.Jitsi
       conference.SessionTerminateInternal();
     }
 
+    [AOT.MonoPInvokeCallback(typeof(AVStack.Jitsi.NativeMethods.ParticipantJoined))]
     internal static void ParticipantJoined(IntPtr opaque, IntPtr nativeParticipant)
     {
       Debug.Log($"Jitsi callback: participant_joined opaque={opaque}");
@@ -325,6 +345,7 @@ namespace AVStack.Jitsi
       Jitsi.asyncOperationQueue.Enqueue(conference.conferenceDelegate.ParticipantJoined(participant));
     }
 
+    [AOT.MonoPInvokeCallback(typeof(AVStack.Jitsi.NativeMethods.ParticipantLeft))]
     internal static void ParticipantLeft(IntPtr opaque, IntPtr nativeParticipant)
     {
       Debug.Log($"Jitsi callback: participant_left opaque={opaque}");
@@ -333,11 +354,13 @@ namespace AVStack.Jitsi
       Jitsi.asyncOperationQueue.Enqueue(conference.conferenceDelegate.ParticipantLeft(participant));
     }
 
+    [AOT.MonoPInvokeCallback(typeof(AVStack.Jitsi.NativeMethods.ColibriMessageReceived))]
     internal static void ColibriMessageReceived(IntPtr opaque, IntPtr nativeColibriMessage)
     {
       Debug.Log($"Jitsi callback: colibri_message_received opaque={opaque}");
     }
 
+    [AOT.MonoPInvokeCallback(typeof(AVStack.Jitsi.NativeMethods.OfferReceived))]
     internal static void OfferReceived(IntPtr opaque, string sessionDescription, bool shouldSendAnswer)
     {
       Debug.Log($"Jitsi callback: offer_received opaque={opaque} shouldSendAnswer={shouldSendAnswer}");
